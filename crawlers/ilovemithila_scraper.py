@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """
-Playwright scraper that downloads Chromium locally (no system Chrome required)
-Works on HPC clusters without root access
+Playwright scraper that uses pre-installed Chromium
 """
 
 import asyncio
@@ -10,21 +9,24 @@ import os
 import re
 import sys
 from pathlib import Path
-from urllib.parse import urlparse
 
-# Set Playwright to use local browsers directory (no root needed)
+# IMPORTANT: Tell Playwright NOT to download its own browser
+os.environ['PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD'] = '1'
 os.environ['PLAYWRIGHT_BROWSERS_PATH'] = str(Path.home() / '.cache' / 'ms-playwright')
+
+# Path to pre-installed Chrome
+CHROME_BIN = os.environ.get('CHROME_BIN', str(Path.home() / '.local/chrome/chrome-linux64/chrome'))
+os.environ['PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH'] = CHROME_BIN
 
 
 async def setup_playwright():
-    """Setup Playwright with local browser installation"""
+    """Setup Playwright without downloading browser"""
     try:
         from playwright.async_api import async_playwright
         return async_playwright
     except ImportError:
         print("Installing playwright...")
         os.system(f"{sys.executable} -m pip install --user playwright")
-        os.system(f"{sys.executable} -m playwright install chromium")
         from playwright.async_api import async_playwright
         return async_playwright
 
@@ -38,17 +40,26 @@ async def scrape_articles(limit=None, output_dir="articles"):
     print("ilovemithila.com Article Scraper")
     print("=" * 60)
     print(f"Output: {output_path.absolute()}")
-    print(f"Browser cache: {os.environ['PLAYWRIGHT_BROWSERS_PATH']}")
+    print(f"Using Chrome: {CHROME_BIN}")
+    print(f"Chrome exists: {os.path.exists(CHROME_BIN)}")
     print()
 
     # Setup Playwright
     playwright_module = await setup_playwright()
 
     async with playwright_module() as p:
-        # Launch browser with local Chromium
+        # Launch browser with pre-installed Chromium
         print("Launching browser...")
+
+        # Check if Chrome exists
+        if not os.path.exists(CHROME_BIN):
+            print(f"ERROR: Chrome not found at {CHROME_BIN}")
+            print("Please install Chrome first using the SLURM script")
+            return 0
+
         browser = await p.chromium.launch(
             headless=True,
+            executable_path=CHROME_BIN,  # Use pre-installed Chrome
             args=[
                 '--no-sandbox',
                 '--disable-setuid-sandbox',
@@ -67,6 +78,8 @@ async def scrape_articles(limit=None, output_dir="articles"):
                 '--safebrowsing-disable-auto-update',
             ]
         )
+
+        print("✓ Browser launched successfully!")
 
         try:
             # Create context with realistic viewport
@@ -132,17 +145,14 @@ async def scrape_articles(limit=None, output_dir="articles"):
                     # Extract article data
                     article = await page.evaluate('''
                         () => {
-                            // Get headline
                             let headline = '';
                             const h1 = document.querySelector('h1.entry-title, h1.post-title, article h1');
                             if (h1) headline = h1.innerText.trim();
 
-                            // Get author
                             let author = '';
                             const authorEl = document.querySelector('.author-name, .meta-author a');
                             if (authorEl) author = authorEl.innerText.trim();
 
-                            // Get date
                             let date = '';
                             const dateMeta = document.querySelector('meta[property="article:published_time"]');
                             if (dateMeta) date = dateMeta.content;
@@ -151,19 +161,15 @@ async def scrape_articles(limit=None, output_dir="articles"):
                                 if (dateEl) date = dateEl.innerText.trim();
                             }
 
-                            // Get content
                             let content = '';
                             const contentEl = document.querySelector('.entry-content, .post-content, article');
                             if (contentEl) {
-                                // Clone to avoid modifying the page
                                 const clone = contentEl.cloneNode(true);
-                                // Remove junk
                                 const junkSelectors = ['.mag-box', '.sharedaddy', '.share-buttons', '#comments', 'script', 'style', 'ins', 'iframe'];
                                 junkSelectors.forEach(sel => {
                                     clone.querySelectorAll(sel).forEach(el => el.remove());
                                 });
                                 content = clone.innerText.trim();
-                                // Clean up extra newlines
                                 content = content.replace(/\\n{3,}/g, '\\n\\n');
                             }
 
@@ -183,7 +189,6 @@ async def scrape_articles(limit=None, output_dir="articles"):
                             'author': article['author'],
                             'date': article['date'],
                             'news_content': article['content'],
-                            'scraped_at': asyncio.get_event_loop().time()
                         }
 
                         filepath = output_path / f"{slug}.json"
@@ -196,7 +201,7 @@ async def scrape_articles(limit=None, output_dir="articles"):
                         failed += 1
                         print(f"  ✗ No content found")
 
-                    await asyncio.sleep(1.5)  # Be polite
+                    await asyncio.sleep(1.5)
 
                 except Exception as e:
                     failed += 1
