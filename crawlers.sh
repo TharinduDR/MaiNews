@@ -3,4 +3,4 @@
 #SBATCH --mail-type=END,FAIL
 #SBATCH --mail-user=t.ranasinghe@lancaster.ac.uk
 
-python -m crawlers.mpp_scraper --out articles_mpp
+python -m crawlers.esamaad --out articles_esamaad
