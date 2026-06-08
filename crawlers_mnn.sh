@@ -3,4 +3,4 @@
 #SBATCH --mail-type=END,FAIL
 #SBATCH --mail-user=t.ranasinghe@lancaster.ac.uk
 
-python -m crawlers.mnn_scraper
+python -m crawlers.mnn
