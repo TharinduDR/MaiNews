@@ -1,219 +1,182 @@
 #!/usr/bin/env python3
 """
-Playwright scraper that uses pre-installed Chromium
+Cloudscraper-based scraper for ilovemithila.com
+No browser needed - works on HPC clusters!
 """
 
-import asyncio
 import json
 import os
 import re
-import sys
+import time
 from pathlib import Path
+from datetime import datetime
 
-# IMPORTANT: Tell Playwright NOT to download its own browser
-os.environ['PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD'] = '1'
-os.environ['PLAYWRIGHT_BROWSERS_PATH'] = str(Path.home() / '.cache' / 'ms-playwright')
+# Install cloudscraper if not available
+try:
+    import cloudscraper
+except ImportError:
+    print("Installing cloudscraper...")
+    os.system("pip install --user cloudscraper")
+    import cloudscraper
 
-# Path to pre-installed Chrome
-CHROME_BIN = os.environ.get('CHROME_BIN', str(Path.home() / '.local/chrome/chrome-linux64/chrome'))
-os.environ['PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH'] = CHROME_BIN
+from bs4 import BeautifulSoup
 
-
-async def setup_playwright():
-    """Setup Playwright without downloading browser"""
-    try:
-        from playwright.async_api import async_playwright
-        return async_playwright
-    except ImportError:
-        print("Installing playwright...")
-        os.system(f"{sys.executable} -m pip install --user playwright")
-        from playwright.async_api import async_playwright
-        return async_playwright
+BASE_URL = "https://www.ilovemithila.com"
 
 
-async def scrape_articles(limit=None, output_dir="articles"):
-    """Main scraping function"""
+def scrape_articles(limit=None, output_dir="articles"):
+    """Main scraping function using cloudscraper"""
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
 
     print("=" * 60)
-    print("ilovemithila.com Article Scraper")
+    print("ilovemithila.com Article Scraper (Cloudscraper)")
     print("=" * 60)
     print(f"Output: {output_path.absolute()}")
-    print(f"Using Chrome: {CHROME_BIN}")
-    print(f"Chrome exists: {os.path.exists(CHROME_BIN)}")
     print()
 
-    # Setup Playwright
-    playwright_module = await setup_playwright()
+    # Create scraper that bypasses Cloudflare
+    print("Initializing cloudscraper...")
+    scraper = cloudscraper.create_scraper(
+        browser={
+            'browser': 'chrome',
+            'platform': 'linux',
+            'desktop': True
+        }
+    )
 
-    async with playwright_module() as p:
-        # Launch browser with pre-installed Chromium
-        print("Launching browser...")
+    # Fetch homepage
+    print("Fetching homepage...")
+    try:
+        response = scraper.get(BASE_URL, timeout=30)
+        response.raise_for_status()
+    except Exception as e:
+        print(f"Failed to fetch homepage: {e}")
+        return 0
 
-        # Check if Chrome exists
-        if not os.path.exists(CHROME_BIN):
-            print(f"ERROR: Chrome not found at {CHROME_BIN}")
-            print("Please install Chrome first using the SLURM script")
-            return 0
+    soup = BeautifulSoup(response.text, 'lxml')
 
-        browser = await p.chromium.launch(
-            headless=True,
-            executable_path=CHROME_BIN,  # Use pre-installed Chrome
-            args=[
-                '--no-sandbox',
-                '--disable-setuid-sandbox',
-                '--disable-dev-shm-usage',
-                '--disable-gpu',
-                '--disable-software-rasterizer',
-                '--disable-extensions',
-                '--disable-background-networking',
-                '--disable-default-apps',
-                '--disable-sync',
-                '--disable-translate',
-                '--hide-scrollbars',
-                '--metrics-recording-only',
-                '--mute-audio',
-                '--no-first-run',
-                '--safebrowsing-disable-auto-update',
-            ]
-        )
+    # Find article URLs
+    print("Discovering articles...")
+    urls = set()
 
-        print("✓ Browser launched successfully!")
+    # Look for links in the main content area
+    for link in soup.find_all('a', href=True):
+        href = link['href']
+        if not href.startswith('http'):
+            continue
+
+        if 'ilovemithila.com' in href:
+            # Look for article patterns
+            if any(p in href for p in ['/20', '/news/', '/story/', '/poem/']):
+                if '?' not in href and '#comments' not in href:
+                    if '/category/' not in href and '/tag/' not in href:
+                        urls.add(href)
+
+    urls = list(urls)
+    print(f"Found {len(urls)} article URLs")
+
+    if limit:
+        urls = urls[:limit]
+
+    saved = 0
+    failed = 0
+
+    for idx, url in enumerate(urls, 1):
+        print(f"\n[{idx}/{len(urls)}] {url[:80]}...")
 
         try:
-            # Create context with realistic viewport
-            context = await browser.new_context(
-                viewport={'width': 1280, 'height': 720},
-                user_agent='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-            )
+            # Fetch article
+            resp = scraper.get(url, timeout=30)
+            if resp.status_code != 200:
+                print(f"  ✗ HTTP {resp.status_code}")
+                failed += 1
+                continue
 
-            page = await context.new_page()
+            soup = BeautifulSoup(resp.text, 'lxml')
 
-            # Navigate to homepage
-            print("Loading homepage...")
-            await page.goto('https://www.ilovemithila.com', wait_until='networkidle', timeout=30000)
+            # Extract headline
+            headline = soup.find('h1', class_='entry-title')
+            if not headline:
+                headline = soup.find('h1', class_='post-title')
+            if not headline:
+                headline = soup.find('h1')
 
-            # Scroll to load more content
-            await page.evaluate('window.scrollTo(0, document.body.scrollHeight)')
-            await asyncio.sleep(2)
+            headline_text = headline.get_text(strip=True) if headline else ""
 
-            # Extract article URLs
-            print("Discovering articles...")
-            urls = await page.evaluate('''
-                () => {
-                    const links = new Set();
-                    const patterns = ['/20', '/news/', '/story/', '/poem/'];
+            # Extract author
+            author = ""
+            author_elem = soup.find(class_='author-name')
+            if not author_elem:
+                author_elem = soup.find(class_='meta-author')
+            if author_elem:
+                author_link = author_elem.find('a')
+                author = author_link.get_text(strip=True) if author_link else author_elem.get_text(strip=True)
 
-                    document.querySelectorAll('a[href]').forEach(link => {
-                        const href = link.href;
-                        if (href && href.includes('ilovemithila.com')) {
-                            let matches = false;
-                            for (const p of patterns) {
-                                if (href.includes(p)) {
-                                    matches = true;
-                                    break;
-                                }
-                            }
-                            if (matches && !href.includes('?') && !href.includes('#comments')) {
-                                if (!href.includes('/category/') && !href.includes('/tag/')) {
-                                    links.add(href);
-                                }
-                            }
-                        }
-                    });
-                    return Array.from(links);
+            # Extract date
+            date = ""
+            date_meta = soup.find('meta', property='article:published_time')
+            if date_meta:
+                date = date_meta.get('content', '')
+            if not date:
+                date_elem = soup.find(class_='date')
+                if date_elem:
+                    date = date_elem.get_text(strip=True)
+
+            # Extract content
+            content_elem = soup.find('div', class_='entry-content')
+            if not content_elem:
+                content_elem = soup.find('div', class_='post-content')
+            if not content_elem:
+                content_elem = soup.find('article')
+
+            content_text = ""
+            if content_elem:
+                # Remove junk elements
+                for junk in content_elem.find_all(
+                        class_=['mag-box', 'sharedaddy', 'share-buttons', 'related-posts', 'post-components']):
+                    junk.decompose()
+                for junk in content_elem.find_all(['script', 'style', 'ins', 'iframe']):
+                    junk.decompose()
+
+                content_text = content_elem.get_text('\n', strip=True)
+                content_text = re.sub(r'\n{3,}', '\n\n', content_text)
+
+            if headline_text and content_text:
+                # Create filename
+                slug = re.sub(r'[^\w\s-]', '', headline_text)
+                slug = re.sub(r'[-\s]+', '-', slug)[:50]
+                slug = slug or f"article_{idx}"
+
+                article_data = {
+                    'url': url,
+                    'headline': headline_text,
+                    'author': author,
+                    'date': date,
+                    'news_content': content_text,
+                    'scraped_at': datetime.now().isoformat()
                 }
-            ''')
 
-            print(f"Found {len(urls)} article URLs")
+                filepath = output_path / f"{slug}.json"
+                with open(filepath, 'w', encoding='utf-8') as f:
+                    json.dump(article_data, f, ensure_ascii=False, indent=2)
 
-            if limit:
-                urls = urls[:limit]
+                saved += 1
+                print(f"  ✓ Saved: {headline_text[:50]}...")
+            else:
+                failed += 1
+                print(f"  ✗ No content found")
 
-            saved = 0
-            failed = 0
+            time.sleep(1)  # Be polite
 
-            for idx, url in enumerate(urls, 1):
-                print(f"\n[{idx}/{len(urls)}] {url[:80]}...")
+        except Exception as e:
+            failed += 1
+            print(f"  ✗ Error: {str(e)[:100]}")
 
-                try:
-                    # Navigate to article
-                    await page.goto(url, wait_until='networkidle', timeout=30000)
-                    await asyncio.sleep(1)
-
-                    # Extract article data
-                    article = await page.evaluate('''
-                        () => {
-                            let headline = '';
-                            const h1 = document.querySelector('h1.entry-title, h1.post-title, article h1');
-                            if (h1) headline = h1.innerText.trim();
-
-                            let author = '';
-                            const authorEl = document.querySelector('.author-name, .meta-author a');
-                            if (authorEl) author = authorEl.innerText.trim();
-
-                            let date = '';
-                            const dateMeta = document.querySelector('meta[property="article:published_time"]');
-                            if (dateMeta) date = dateMeta.content;
-                            if (!date) {
-                                const dateEl = document.querySelector('.date.meta-item, time');
-                                if (dateEl) date = dateEl.innerText.trim();
-                            }
-
-                            let content = '';
-                            const contentEl = document.querySelector('.entry-content, .post-content, article');
-                            if (contentEl) {
-                                const clone = contentEl.cloneNode(true);
-                                const junkSelectors = ['.mag-box', '.sharedaddy', '.share-buttons', '#comments', 'script', 'style', 'ins', 'iframe'];
-                                junkSelectors.forEach(sel => {
-                                    clone.querySelectorAll(sel).forEach(el => el.remove());
-                                });
-                                content = clone.innerText.trim();
-                                content = content.replace(/\\n{3,}/g, '\\n\\n');
-                            }
-
-                            return {headline, author, date, content};
-                        }
-                    ''')
-
-                    if article['headline'] and article['content']:
-                        # Create filename
-                        slug = re.sub(r'[^\w\s-]', '', article['headline'])
-                        slug = re.sub(r'[-\s]+', '-', slug)[:50]
-                        slug = slug or f"article_{idx}"
-
-                        article_data = {
-                            'url': url,
-                            'headline': article['headline'],
-                            'author': article['author'],
-                            'date': article['date'],
-                            'news_content': article['content'],
-                        }
-
-                        filepath = output_path / f"{slug}.json"
-                        with open(filepath, 'w', encoding='utf-8') as f:
-                            json.dump(article_data, f, ensure_ascii=False, indent=2)
-
-                        saved += 1
-                        print(f"  ✓ Saved: {article['headline'][:50]}...")
-                    else:
-                        failed += 1
-                        print(f"  ✗ No content found")
-
-                    await asyncio.sleep(1.5)
-
-                except Exception as e:
-                    failed += 1
-                    print(f"  ✗ Error: {str(e)[:100]}")
-                    continue
-
-            print(f"\n" + "=" * 60)
-            print(f"✅ Complete: {saved} saved, {failed} failed")
-            print(f"📁 Output: {output_path.absolute()}")
-
-        finally:
-            await browser.close()
+    print(f"\n" + "=" * 60)
+    print(f"✅ Complete: {saved} saved, {failed} failed")
+    print(f"📁 Output: {output_path.absolute()}")
+    return saved
 
 
 def main():
@@ -223,7 +186,7 @@ def main():
     parser.add_argument('--out', default='articles', help='Output directory')
     args = parser.parse_args()
 
-    asyncio.run(scrape_articles(limit=args.limit, output_dir=args.out))
+    scrape_articles(limit=args.limit, output_dir=args.out)
 
 
 if __name__ == "__main__":
