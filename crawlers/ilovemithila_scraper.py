@@ -1,186 +1,173 @@
 #!/usr/bin/env python3
 """
-Selenium-based scraper - More reliable on shared Linux systems
+Simple requests-based scraper - No browser needed!
 """
 
 import json
 import os
 import re
 import time
-from pathlib import Path
-from urllib.parse import urlparse
-from selenium import webdriver
-from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.common.by import By
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
+import requests
 from bs4 import BeautifulSoup
+from urllib.parse import urljoin, urlparse
+from datetime import datetime
 
 BASE_URL = "https://www.ilovemithila.com"
 OUTPUT_DIR = "articles"
 
+HEADERS = {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+    'Accept-Language': 'en-US,en;q=0.5',
+    'Accept-Encoding': 'gzip, deflate',
+    'Connection': 'keep-alive',
+}
 
-def setup_driver():
-    """Setup Chrome driver for headless operation"""
-    options = Options()
-    options.add_argument('--headless=new')
-    options.add_argument('--no-sandbox')
-    options.add_argument('--disable-dev-shm-usage')
-    options.add_argument('--disable-gpu')
-    options.add_argument('--disable-blink-features=AutomationControlled')
-    options.add_experimental_option("excludeSwitches", ["enable-automation"])
-    options.add_experimental_option('useAutomationExtension', False)
 
-    # Try different driver paths
-    driver = None
+def get_article_urls():
+    """Extract article URLs from homepage"""
+    print(f"Fetching {BASE_URL}...")
+    resp = requests.get(BASE_URL, headers=HEADERS, timeout=30)
+    resp.raise_for_status()
+
+    soup = BeautifulSoup(resp.text, 'lxml')
+    urls = set()
+
+    # Find all article links
+    for link in soup.find_all('a', href=True):
+        href = link['href']
+        if not href.startswith('http'):
+            href = urljoin(BASE_URL, href)
+
+        if 'ilovemithila.com' in href:
+            # Filter for article patterns
+            if any(pattern in href for pattern in ['/20', '/news/', '/story/', '/poem/']):
+                if '?' not in href and '#comments' not in href:
+                    if '/category/' not in href and '/tag/' not in href:
+                        urls.add(href)
+
+    print(f"Found {len(urls)} article URLs")
+    return list(urls)
+
+
+def extract_article(url):
+    """Extract article data from URL"""
     try:
-        from webdriver_manager.chrome import ChromeDriverManager
-        from selenium.webdriver.chrome.service import Service
-        service = Service(ChromeDriverManager().install())
-        driver = webdriver.Chrome(service=service, options=options)
-    except:
-        try:
-            driver = webdriver.Chrome(options=options)
-        except:
-            print("Chrome driver not found. Installing...")
-            os.system("pip install webdriver-manager")
-            from webdriver_manager.chrome import ChromeDriverManager
-            from selenium.webdriver.chrome.service import Service
-            service = Service(ChromeDriverManager().install())
-            driver = webdriver.Chrome(service=service, options=options)
+        resp = requests.get(url, headers=HEADERS, timeout=30)
+        resp.raise_for_status()
+    except Exception as e:
+        print(f"  Failed to fetch: {e}")
+        return None
 
-    driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
-    return driver
+    soup = BeautifulSoup(resp.text, 'lxml')
+
+    article = {'url': url, 'scraped_at': datetime.now().isoformat()}
+
+    # Get headline
+    headline = soup.find('h1', class_='entry-title') or soup.find('h1', class_='post-title')
+    if not headline:
+        headline = soup.find('h1')
+    article['headline'] = headline.get_text(strip=True) if headline else ''
+
+    # Get author
+    author = soup.find(class_='author-name') or soup.find(class_='meta-author')
+    if author:
+        author_link = author.find('a')
+        article['author'] = author_link.get_text(strip=True) if author_link else author.get_text(strip=True)
+    else:
+        article['author'] = ''
+
+    # Get date
+    date_meta = soup.find('meta', property='article:published_time')
+    if date_meta:
+        article['date'] = date_meta.get('content', '')
+    else:
+        date_elem = soup.find(class_='date')
+        article['date'] = date_elem.get_text(strip=True) if date_elem else ''
+
+    # Get content
+    content = soup.find(class_='entry-content') or soup.find(class_='post-content')
+    if not content:
+        content = soup.find('article')
+
+    if content:
+        # Remove junk
+        for junk in content.find_all(class_=['mag-box', 'sharedaddy', 'share-buttons', 'related-posts']):
+            junk.decompose()
+        for junk in content.find_all(['script', 'style', 'ins', 'iframe']):
+            junk.decompose()
+
+        article['news_content'] = content.get_text('\n', strip=True)
+        # Clean up excessive newlines
+        article['news_content'] = re.sub(r'\n{3,}', '\n\n', article['news_content'])
+    else:
+        article['news_content'] = ''
+
+    return article
+
+
+def save_article(article, output_dir):
+    """Save article to JSON file"""
+    if not article['headline'] or not article['news_content']:
+        return False
+
+    # Create filename
+    slug = re.sub(r'[^\w\s-]', '', article['headline'])
+    slug = re.sub(r'[-\s]+', '-', slug)[:50]
+    filename = f"{slug}.json"
+    filepath = os.path.join(output_dir, filename)
+
+    with open(filepath, 'w', encoding='utf-8') as f:
+        json.dump(article, f, ensure_ascii=False, indent=2)
+
+    return True
 
 
 def scrape_articles(limit=None, output_dir=OUTPUT_DIR):
     """Main scraping function"""
     os.makedirs(output_dir, exist_ok=True)
 
-    print("Setting up driver...")
-    driver = setup_driver()
+    print("=" * 60)
+    print("ilovemithila.com Article Scraper (No Browser Needed)")
+    print("=" * 60)
 
-    try:
-        print(f"Loading {BASE_URL}...")
-        driver.get(BASE_URL)
-        time.sleep(3)
+    # Get URLs
+    urls = get_article_urls()
+    if not urls:
+        print("No URLs found!")
+        return
 
-        # Find article links
-        print("Discovering articles...")
-        article_urls = set()
+    if limit:
+        urls = urls[:limit]
 
-        # Scroll to load more
-        driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-        time.sleep(2)
+    saved = 0
+    failed = 0
 
-        # Find all links
-        links = driver.find_elements(By.TAG_NAME, "a")
-        for link in links:
-            href = link.get_attribute("href")
-            if href and "ilovemithila.com" in href:
-                # Filter for article URLs
-                if any(pattern in href for pattern in ['/20', '/news/', '/story/', '/poem/']):
-                    if '?' not in href and '#comments' not in href:
-                        if '/category/' not in href and '/tag/' not in href:
-                            article_urls.add(href)
+    for idx, url in enumerate(urls, 1):
+        print(f"\n[{idx}/{len(urls)}] {url[:80]}...")
 
-        article_urls = list(article_urls)
-        print(f"Found {len(article_urls)} article URLs")
+        article = extract_article(url)
 
-        if limit:
-            article_urls = article_urls[:limit]
+        if article and save_article(article, output_dir):
+            saved += 1
+            print(f"  ✓ Saved: {article['headline'][:50]}...")
+        else:
+            failed += 1
+            print(f"  ✗ Failed")
 
-        saved = 0
-        failed = 0
+        time.sleep(1)  # Be polite
 
-        for idx, url in enumerate(article_urls, 1):
-            print(f"\n[{idx}/{len(article_urls)}] {url[:80]}...")
-
-            try:
-                driver.get(url)
-                time.sleep(2)
-
-                # Extract data
-                article = {}
-                article['url'] = url
-
-                # Get headline
-                try:
-                    headline_elem = WebDriverWait(driver, 10).until(
-                        EC.presence_of_element_located((By.CSS_SELECTOR, "h1.entry-title, h1.post-title, article h1"))
-                    )
-                    article['headline'] = headline_elem.text.strip()
-                except:
-                    article['headline'] = ""
-
-                # Get author
-                try:
-                    author_elem = driver.find_element(By.CSS_SELECTOR, ".author-name, .meta-author a")
-                    article['author'] = author_elem.text.strip()
-                except:
-                    article['author'] = ""
-
-                # Get date
-                try:
-                    date_elem = driver.find_element(By.CSS_SELECTOR, ".date.meta-item, time[datetime]")
-                    article['date'] = date_elem.get_attribute("datetime") or date_elem.text.strip()
-                except:
-                    article['date'] = ""
-
-                # Get content
-                try:
-                    content_elem = driver.find_element(By.CSS_SELECTOR, ".entry-content, .post-content")
-                    content_html = content_elem.get_attribute('innerHTML')
-
-                    # Clean content
-                    soup = BeautifulSoup(content_html, 'lxml')
-
-                    # Remove junk
-                    junk_selectors = ['.mag-box', '.share-buttons', '#comments', 'script', 'style', 'ins']
-                    for sel in junk_selectors:
-                        for el in soup.select(sel):
-                            el.decompose()
-
-                    article['news_content'] = soup.get_text('\n', strip=True)
-                    article['news_content'] = re.sub(r'\n{3,}', '\n\n', article['news_content'])
-                except:
-                    article['news_content'] = ""
-
-                # Only save if we have content
-                if article['headline'] and article['news_content']:
-                    # Create filename
-                    slug = re.sub(r'[^a-zA-Z0-9]', '_', article['headline'][:50])
-                    filename = f"{slug}.json"
-                    filepath = os.path.join(output_dir, filename)
-
-                    with open(filepath, 'w', encoding='utf-8') as f:
-                        json.dump(article, f, ensure_ascii=False, indent=2)
-
-                    saved += 1
-                    print(f"  ✓ Saved: {article['headline'][:50]}...")
-                else:
-                    failed += 1
-                    print(f"  ✗ Insufficient data")
-
-                time.sleep(1)
-
-            except Exception as e:
-                failed += 1
-                print(f"  ✗ Error: {e}")
-                continue
-
-        print(f"\n✅ Completed: {saved} saved, {failed} failed")
-
-    finally:
-        driver.quit()
+    print(f"\n✅ Done: {saved} saved, {failed} failed")
+    print(f"📁 Output: {os.path.abspath(output_dir)}")
 
 
 if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser()
-    parser.add_argument('--limit', type=int, help='Number of articles to scrape')
+    parser.add_argument('--limit', type=int, help='Number of articles')
     parser.add_argument('--out', default='articles', help='Output directory')
+    parser.add_argument('--delay', type=float, default=1, help='Delay between requests')
     args = parser.parse_args()
 
     scrape_articles(limit=args.limit, output_dir=args.out)
