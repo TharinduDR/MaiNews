@@ -48,8 +48,14 @@ import requests
 from bs4 import BeautifulSoup
 
 BASE = "https://maithilijindabaad.com"
-API_POSTS = BASE + "/wp-json/wp/v2/posts"
 DEFAULT_DELAY = 3.0           # no robots crawl-delay advertised; be courteous
+
+# WordPress exposes the REST API two ways. With pretty permalinks it lives at
+# /wp-json/...; with PLAIN permalinks (this site uses ?p=NNN) the pretty path
+# 301s to the homepage and you must use the query-string form,
+# /index.php?rest_route=/wp/v2/posts . Both are documented; we auto-detect.
+API_PRETTY_ROOT = BASE + "/wp-json/"
+API_REST_ROUTE_ROOT = BASE + "/index.php"
 
 CONTENT_SELECTORS = [".post-content", ".entry-content", "article"]
 JUNK_SELECTORS = [
@@ -157,23 +163,58 @@ def is_article_url(url: str) -> bool:
 # --------------------------------------------------------------------------- #
 #  Strategy 1 — WordPress REST API
 # --------------------------------------------------------------------------- #
+def _json_or_none(r):
+    if r is None or r.status_code != 200:
+        return None
+    ctype = r.headers.get("Content-Type", "")
+    if "json" not in ctype and not r.text.lstrip().startswith(("{", "[")):
+        return None
+    try:
+        return r.json()
+    except ValueError:
+        return None
+
+
+def resolve_api_mode(session, delay):
+    """Return 'pretty' or 'rest_route' depending on which the site answers."""
+    r = fetch(session, API_PRETTY_ROOT, delay=delay)
+    if isinstance(_json_or_none(r), dict):
+        return "pretty"
+    r = fetch(session, API_REST_ROUTE_ROOT, params={"rest_route": "/"}, delay=delay)
+    if isinstance(_json_or_none(r), dict):
+        return "rest_route"
+    return None
+
+
+def fetch_posts_page(session, mode, page, delay):
+    """Fetch one page of /wp/v2/posts using the detected API form."""
+    common = {"per_page": 100, "page": page, "_embed": "1"}
+    if mode == "rest_route":
+        params = {"rest_route": "/wp/v2/posts", **common}
+        return fetch(session, API_REST_ROUTE_ROOT, params=params, delay=delay)
+    params = common
+    return fetch(session, API_PRETTY_ROOT + "wp/v2/posts", params=params, delay=delay)
+
+
 def scrape_via_api(session, out_dir, limit=None, delay=DEFAULT_DELAY):
+    mode = resolve_api_mode(session, delay)
+    if mode is None:
+        raise requests.HTTPError("No working REST API endpoint (pretty or rest_route)")
+    print(f"REST API mode: {mode}")
+
     saved, page = 0, 1
     while True:
-        params = {"per_page": 100, "page": page, "_embed": "1"}
-        r = fetch(session, API_POSTS, params=params, delay=delay)
+        r = fetch_posts_page(session, mode, page, delay)
         if r.status_code == 400:
             break
         if r.status_code == 403:
             raise requests.HTTPError("403 from REST API", response=r)
         r.raise_for_status()
 
-        # The 301 is followed automatically; make sure we actually got JSON.
-        try:
-            posts = r.json()
-        except ValueError:
-            raise requests.HTTPError("REST API did not return JSON "
-                                     f"(landed on {r.url})", response=r)
+        posts = _json_or_none(r)
+        if posts is None:
+            raise requests.HTTPError(f"REST API did not return JSON (landed on {r.url})",
+                                     response=r)
         if not isinstance(posts, list):
             raise requests.HTTPError("Unexpected REST API payload", response=r)
         if not posts:
