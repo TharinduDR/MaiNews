@@ -3,4 +3,4 @@
 #SBATCH --mail-type=END,FAIL
 #SBATCH --mail-user=t.ranasinghe@lancaster.ac.uk
 
-python -m crawlers.mnn
+python -m crawlers.mnn --delay 20
