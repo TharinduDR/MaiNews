@@ -3,4 +3,4 @@
 #SBATCH --mail-type=END,FAIL
 #SBATCH --mail-user=t.ranasinghe@lancaster.ac.uk
 
-python -m crawlers.ilovemithila_scraper --out articles
+python -m crawlers.ilovemithila_scraper --method crawl --delay 3 --out articles
